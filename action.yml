@@ -1,0 +1,259 @@
+name: "Valystrum Security Pipeline"
+description: "Scan a pull request for leaked secrets, code vulnerabilities (SAST) and IaC misconfiguration, and block the merge on critical/high findings."
+author: "Valystrum"
+
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  webhook-url:
+    description: "Valystrum scan URL, e.g. https://app.valystrum.io/api/v1/<org>/pipeline/scan"
+    required: true
+  webhook-secret:
+    description: "Repository CI secret (cs_wh_…) from POST /api/v1/<org>/pipeline/config. The same secret the SBOM action uses. Store it as a repository secret."
+    required: true
+  base-ref:
+    description: "Ref to diff against. Defaults to the PR's base SHA, or the previous commit on a push."
+    default: ""
+  paths:
+    description: "Optional space-separated pathspecs to limit the diff, e.g. 'infra/ app/'."
+    default: ""
+  send-file-contents:
+    description: "Send the changed files' contents so SAST can run. Without this only secret + IaC scanning happens — SAST needs whole files, a diff carries only hunks."
+    default: "true"
+  fail-on-findings:
+    description: "Fail the job when the scan returns passed=false (any critical/high finding)."
+    default: "true"
+  fail-on-error:
+    description: "Fail the job if the scan endpoint cannot be reached. Default false: a scanner outage must not block your merges."
+    default: "false"
+  github-token:
+    description: "Token used by Valystrum to post the findings as a PR comment. Omit to skip commenting."
+    default: ""
+
+outputs:
+  passed:
+    description: "'true' when no critical/high finding was reported."
+    value: ${{ steps.scan.outputs.passed }}
+  findings:
+    description: "Number of findings reported."
+    value: ${{ steps.scan.outputs.findings }}
+  scan-id:
+    description: "Valystrum scan id, for cross-referencing in the dashboard."
+    value: ${{ steps.scan.outputs.scan-id }}
+
+runs:
+  using: composite
+  steps:
+    - id: diff
+      name: Compute the pull-request diff
+      shell: bash
+      env:
+        BASE_REF_INPUT: ${{ inputs.base-ref }}
+        PATHS: ${{ inputs.paths }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        EVENT_BEFORE: ${{ github.event.before }}
+      run: |
+        set -euo pipefail
+
+        # actions/checkout defaults to a depth-1 clone, which has no base commit
+        # to diff against — the scan then sees "no changes" on every run and
+        # silently reports nothing. Deepen here rather than making every caller
+        # remember `fetch-depth: 0`.
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          echo "Shallow clone detected — fetching history so the diff has a base."
+          git fetch --unshallow --quiet || git fetch --depth=50 --quiet || true
+        fi
+
+        BASE="${BASE_REF_INPUT:-}"
+        if [ -z "$BASE" ] && [ -n "${PR_BASE_SHA:-}" ]; then
+          BASE="$PR_BASE_SHA"
+          git fetch --quiet origin "$PR_BASE_SHA" 2>/dev/null || true
+        fi
+        if [ -z "$BASE" ] && [ -n "${EVENT_BEFORE:-}" ] && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+          BASE="$EVENT_BEFORE"
+        fi
+        # Last resort: the parent commit. Correct for a single-commit push and
+        # never empty, which is what matters — an empty base scans nothing.
+        [ -z "$BASE" ] && BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+
+        if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+          echo "::warning::Base ref '$BASE' is not in this clone; falling back to HEAD~1."
+          BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+        fi
+
+        echo "Diffing $BASE..HEAD"
+        # shellcheck disable=SC2086 — PATHS is an intentional word-split pathspec
+        if [ -n "$PATHS" ]; then
+          git diff --unified=3 "$BASE"...HEAD -- $PATHS > "$RUNNER_TEMP/valystrum.diff"
+        else
+          git diff --unified=3 "$BASE"...HEAD > "$RUNNER_TEMP/valystrum.diff"
+        fi
+
+        CHANGED=$(git diff --name-only "$BASE"...HEAD ${PATHS:+-- $PATHS} | wc -l | tr -d ' ')
+        echo "base=$BASE"        >> "$GITHUB_OUTPUT"
+        echo "changed=$CHANGED"  >> "$GITHUB_OUTPUT"
+        echo "$CHANGED file(s) changed."
+
+    - id: scan
+      name: Valystrum security scan
+      shell: bash
+      env:
+        WEBHOOK_URL: ${{ inputs.webhook-url }}
+        WEBHOOK_SECRET: ${{ inputs.webhook-secret }}
+        SEND_FILES: ${{ inputs.send-file-contents }}
+        FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        GH_TOKEN_INPUT: ${{ inputs.github-token }}
+        BASE: ${{ steps.diff.outputs.base }}
+        CHANGED: ${{ steps.diff.outputs.changed }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$WEBHOOK_SECRET" ]; then
+          echo "::error::webhook-secret is empty. Check the repository secret name in your workflow."
+          exit 1
+        fi
+
+        DIFF="$RUNNER_TEMP/valystrum.diff"
+        if [ ! -s "$DIFF" ]; then
+          echo "No changes to scan."
+          echo "passed=true"  >> "$GITHUB_OUTPUT"
+          echo "findings=0"   >> "$GITHUB_OUTPUT"
+          echo "scan-id="     >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # ── Changed file contents ────────────────────────────────────────────
+        # SAST parses whole files; a unified diff carries only hunks. Without
+        # these the platform runs secrets + IaC only and reports why.
+        # Caps mirror the server's: 300 files, 512 KB each, 2 MB total body.
+        FILES_JSON="$RUNNER_TEMP/valystrum-files.json"
+        echo "[]" > "$FILES_JSON"
+
+        if [ "$SEND_FILES" = "true" ]; then
+          : > "$RUNNER_TEMP/file-list.txt"
+          # Deleted files have no content to scan; skip them (status filter ACMR).
+          git diff --name-only --diff-filter=ACMR "$BASE"...HEAD > "$RUNNER_TEMP/file-list.txt" || true
+
+          BUDGET=$((1500 * 1024))   # leave headroom under the 2 MB body cap for the diff
+          USED=0
+          COUNT=0
+          SKIPPED=0
+          : > "$RUNNER_TEMP/files.ndjson"
+
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ -f "$f" ] || continue
+            [ "$COUNT" -ge 300 ] && { SKIPPED=$((SKIPPED+1)); continue; }
+
+            SIZE=$(wc -c < "$f" | tr -d ' ')
+            if [ "$SIZE" -gt $((512 * 1024)) ] || [ $((USED + SIZE)) -gt "$BUDGET" ]; then
+              SKIPPED=$((SKIPPED+1)); continue
+            fi
+            # Binary files break JSON encoding and mean nothing to the scanners.
+            if LC_ALL=C grep -qI . "$f" 2>/dev/null; then
+              jq -Rn --arg path "$f" --rawfile content "$f" '{path: $path, content: $content}' \
+                >> "$RUNNER_TEMP/files.ndjson"
+              USED=$((USED + SIZE)); COUNT=$((COUNT+1))
+            fi
+          done < "$RUNNER_TEMP/file-list.txt"
+
+          if [ -s "$RUNNER_TEMP/files.ndjson" ]; then
+            jq -s '.' "$RUNNER_TEMP/files.ndjson" > "$FILES_JSON"
+          fi
+          echo "Sending $COUNT file(s) for code analysis$([ "$SKIPPED" -gt 0 ] && echo ", $SKIPPED skipped (size/binary/cap)")."
+        else
+          echo "send-file-contents is false — SAST will be skipped by the platform."
+        fi
+
+        # ── Signed request ───────────────────────────────────────────────────
+        PAYLOAD="$RUNNER_TEMP/valystrum-payload.json"
+        RESPONSE="$RUNNER_TEMP/valystrum-response.json"
+
+        jq -n \
+          --arg repo "$GITHUB_REPOSITORY" \
+          --arg branch "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" \
+          --arg commitSha "$GITHUB_SHA" \
+          --arg diff "$(base64 -w0 < "$DIFF" 2>/dev/null || base64 < "$DIFF" | tr -d '\n')" \
+          --arg githubToken "$GH_TOKEN_INPUT" \
+          --argjson prNumber "${PR_NUMBER:-null}" \
+          --slurpfile files "$FILES_JSON" \
+          '{repo: $repo, branch: $branch, commitSha: $commitSha, diff: $diff, files: $files[0]}
+           + (if $prNumber == null then {} else {prNumber: $prNumber} end)
+           + (if $githubToken == "" then {} else {githubToken: $githubToken} end)' \
+          > "$PAYLOAD"
+
+        BYTES=$(wc -c < "$PAYLOAD" | tr -d ' ')
+        if [ "$BYTES" -gt $((2 * 1024 * 1024)) ]; then
+          echo "::warning::Payload is ${BYTES} bytes (over the 2 MB cap); retrying without file contents."
+          jq 'del(.files)' "$PAYLOAD" > "$PAYLOAD.tmp" && mv "$PAYLOAD.tmp" "$PAYLOAD"
+        fi
+
+        # HMAC-SHA256 over the exact bytes curl sends (--data-binary is verbatim).
+        SIGNATURE=$(openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" "$PAYLOAD" | awk '{print $NF}')
+
+        CODE=$(curl -sS --retry 2 --retry-all-errors --max-time 120 \
+          -o "$RESPONSE" -w '%{http_code}' \
+          -X POST "$WEBHOOK_URL" \
+          -H 'content-type: application/json' \
+          -H "x-cs-signature: sha256=$SIGNATURE" \
+          --data-binary @"$PAYLOAD") || CODE="000"
+
+        if [ "$CODE" != "200" ]; then
+          echo "::error::Valystrum scan failed (HTTP $CODE): $(head -c 500 "$RESPONSE" 2>/dev/null)"
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+          echo "findings=0"  >> "$GITHUB_OUTPUT"
+          echo "scan-id="    >> "$GITHUB_OUTPUT"
+          # Fail-open by default: a scanner outage must never block a merge.
+          [ "$FAIL_ON_ERROR" = "true" ] && exit 1
+          exit 0
+        fi
+
+        # NOT `.passed // true`: jq's `//` treats `false` as absent, so a failed
+        # scan would read as a pass and the gate would never block anything.
+        PASSED=$(jq -r 'if .passed == null then true else .passed end' "$RESPONSE")
+        COUNT=$(jq  -r '.findings | length // 0' "$RESPONSE")
+        SCAN_ID=$(jq -r '.scanId // ""'    "$RESPONSE")
+        SAST_STATUS=$(jq -r '.scanned.sastStatus // "unknown"' "$RESPONSE")
+        SAST_FILES=$(jq -r '.scanned.sastFilesScanned // 0'    "$RESPONSE")
+
+        echo "passed=$PASSED"    >> "$GITHUB_OUTPUT"
+        echo "findings=$COUNT"   >> "$GITHUB_OUTPUT"
+        echo "scan-id=$SCAN_ID"  >> "$GITHUB_OUTPUT"
+
+        # ── Job summary ──────────────────────────────────────────────────────
+        {
+          echo "### Valystrum Security Scan"
+          echo ""
+          if [ "$SAST_STATUS" = "ok" ]; then
+            echo "Analysed **$SAST_FILES** file(s) — SAST + secrets + IaC."
+          else
+            echo "Scanned the diff for secrets and IaC. Code analysis: \`$SAST_STATUS\`."
+          fi
+          echo ""
+          if [ "$COUNT" = "0" ]; then
+            echo "No findings."
+          else
+            echo "| Severity | Rule | Location |"
+            echo "|---|---|---|"
+            jq -r '.findings | sort_by(
+                     if .severity=="critical" then 0 elif .severity=="high" then 1
+                     elif .severity=="medium" then 2 else 3 end)
+                   | .[:20][] | "| \(.severity) | `\(.ruleId)` | `\(.file):\(.line)` |"' "$RESPONSE"
+            [ "$COUNT" -gt 20 ] && echo "" && echo "_…and $((COUNT - 20)) more._"
+          fi
+          [ -n "$SCAN_ID" ] && echo "" && echo "_Scan ID: \`$SCAN_ID\`_"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Findings are annotated inline so they show on the PR's Files tab.
+        jq -r '.findings[]? | "::\(if .severity=="critical" or .severity=="high" then "error" else "warning" end) file=\(.file),line=\(.line),title=\(.ruleId)::\(.message)"' "$RESPONSE" || true
+
+        if [ "$PASSED" != "true" ]; then
+          echo "::error::Valystrum: $COUNT finding(s), including critical/high. See the job summary."
+          [ "$FAIL_ON_FINDINGS" = "true" ] && exit 1
+        fi
+
+        echo "Scan complete: $COUNT finding(s), passed=$PASSED."

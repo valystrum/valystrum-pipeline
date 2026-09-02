@@ -1,0 +1,29 @@
+# Copy to .github/workflows/security-scan.yml in your repository.
+name: security-scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write   # only needed for the PR comment (github-token below)
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The scan diffs your branch against its base. A depth-1 clone has no
+          # base commit, so the diff comes out empty and the scan sees nothing.
+          # The action deepens a shallow clone itself, but setting this is faster.
+          fetch-depth: 0
+
+      - uses: valystrum/pipeline-action@v1
+        with:
+          webhook-url: https://app.valystrum.io/api/v1/acme/pipeline/scan
+          webhook-secret: ${{ secrets.CS_WEBHOOK_SECRET }}
+          # Lets Valystrum post the findings as a PR comment. Omit to skip.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
