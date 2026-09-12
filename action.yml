@@ -173,11 +173,14 @@ runs:
         PAYLOAD="$RUNNER_TEMP/valystrum-payload.json"
         RESPONSE="$RUNNER_TEMP/valystrum-response.json"
 
+        # base64 via file, not --arg: one argv string is capped at 128 KB on Linux (E2BIG).
+        base64 -w0 < "$DIFF" > "$DIFF.b64" 2>/dev/null || base64 < "$DIFF" | tr -d '\n' > "$DIFF.b64"
+
         jq -n \
           --arg repo "$GITHUB_REPOSITORY" \
           --arg branch "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" \
           --arg commitSha "$GITHUB_SHA" \
-          --arg diff "$(base64 -w0 < "$DIFF" 2>/dev/null || base64 < "$DIFF" | tr -d '\n')" \
+          --rawfile diff "$DIFF.b64" \
           --arg githubToken "$GH_TOKEN_INPUT" \
           --argjson prNumber "${PR_NUMBER:-null}" \
           --slurpfile files "$FILES_JSON" \
