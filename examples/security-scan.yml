@@ -21,7 +21,7 @@ jobs:
           # The action deepens a shallow clone itself, but setting this is faster.
           fetch-depth: 0
 
-      - uses: valystrum/pipeline-action@v1
+      - uses: valystrum/valystrum-pipeline@v1
         with:
           webhook-url: https://app.valystrum.io/api/v1/acme/pipeline/scan
           webhook-secret: ${{ secrets.CS_WEBHOOK_SECRET }}

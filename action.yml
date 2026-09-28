@@ -195,15 +195,25 @@ runs:
           jq 'del(.files)' "$PAYLOAD" > "$PAYLOAD.tmp" && mv "$PAYLOAD.tmp" "$PAYLOAD"
         fi
 
-        # HMAC-SHA256 over the exact bytes curl sends (--data-binary is verbatim).
-        SIGNATURE=$(openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" "$PAYLOAD" | awk '{print $NF}')
-
-        CODE=$(curl -sS --retry 2 --retry-all-errors --max-time 120 \
-          -o "$RESPONSE" -w '%{http_code}' \
-          -X POST "$WEBHOOK_URL" \
-          -H 'content-type: application/json' \
-          -H "x-cs-signature: sha256=$SIGNATURE" \
-          --data-binary @"$PAYLOAD") || CODE="000"
+        # Stamped HMAC-SHA256 (ADR-0155): the digest covers "<unix seconds>.<body>",
+        # over the exact bytes curl sends (--data-binary is verbatim). The platform
+        # accepts a stamp within five minutes and once, so every attempt signs
+        # afresh: a resent signature is refused as already used. The pause between
+        # attempts is at least a second, so each attempt carries a new stamp.
+        for ATTEMPT in 1 2 3; do
+          : > "$RESPONSE"  # curl leaves -o untouched when nothing answers: no earlier attempt's body in the error
+          T=$(date +%s)
+          SIGNATURE=$( { printf '%s.' "$T"; cat "$PAYLOAD"; } | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $NF}')
+          CODE=$(curl -sS --max-time 120 \
+            -o "$RESPONSE" -w '%{http_code}' \
+            -X POST "$WEBHOOK_URL" \
+            -H 'content-type: application/json' \
+            -H "x-cs-signature: t=$T,v1=$SIGNATURE" \
+            --data-binary @"$PAYLOAD") || CODE="000"
+          # Retried as curl's own retry did: no answer, 408, 429 and 5xx.
+          case "$CODE" in 000|408|429|5??) ;; *) break ;; esac
+          if [ "$ATTEMPT" -lt 3 ]; then sleep $((1 << (ATTEMPT - 1))); fi
+        done
 
         if [ "$CODE" != "200" ]; then
           echo "::error::Valystrum scan failed (HTTP $CODE): $(head -c 500 "$RESPONSE" 2>/dev/null)"
