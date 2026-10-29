@@ -20,13 +20,13 @@ inputs:
     description: "Optional space-separated pathspecs to limit the diff, e.g. 'infra/ app/'."
     default: ""
   send-file-contents:
-    description: "Send the changed files' contents so SAST can run. Without this only secret + IaC scanning happens — SAST needs whole files, a diff carries only hunks."
+    description: "Send the changed files' contents so code analysis (SAST) and the IaC checks can run. Without this only secrets are scanned: both need whole files, a diff carries only hunks."
     default: "true"
   fail-on-findings:
     description: "Fail the job when the scan returns passed=false (any critical/high finding)."
     default: "true"
   fail-on-error:
-    description: "Fail the job if the scan endpoint cannot be reached. Default false: a scanner outage must not block your merges."
+    description: "Fail the job if the scan endpoint cannot be reached, refuses the request, answers that it could not complete the scan (an error in the answer), or did not finish checking the files the action sent (its code and IaC scanner timed out, failed or is not configured). Default false: a scanner outage must not block your merges."
     default: "false"
   github-token:
     description: "Token used by Valystrum to post the findings as a PR comment. Omit to skip commenting."
@@ -76,11 +76,11 @@ runs:
         fi
         # Last resort: the parent commit. Correct for a single-commit push and
         # never empty, which is what matters — an empty base scans nothing.
-        [ -z "$BASE" ] && BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+        [ -z "$BASE" ] && BASE="$(git rev-parse -q --verify HEAD~1 || git rev-parse HEAD)"
 
         if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
           echo "::warning::Base ref '$BASE' is not in this clone; falling back to HEAD~1."
-          BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          BASE="$(git rev-parse -q --verify HEAD~1 || git rev-parse HEAD)"
         fi
 
         echo "Diffing $BASE..HEAD"
@@ -109,6 +109,7 @@ runs:
         BASE: ${{ steps.diff.outputs.base }}
         CHANGED: ${{ steps.diff.outputs.changed }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       run: |
         set -euo pipefail
 
@@ -128,7 +129,7 @@ runs:
 
         # ── Changed file contents ────────────────────────────────────────────
         # SAST parses whole files; a unified diff carries only hunks. Without
-        # these the platform runs secrets + IaC only and reports why.
+        # these the platform checks secrets only, and reports why.
         # Caps mirror the server's: 300 files, 512 KB each, 2 MB total body.
         FILES_JSON="$RUNNER_TEMP/valystrum-files.json"
         echo "[]" > "$FILES_JSON"
@@ -166,7 +167,7 @@ runs:
           fi
           echo "Sending $COUNT file(s) for code analysis$([ "$SKIPPED" -gt 0 ] && echo ", $SKIPPED skipped (size/binary/cap)")."
         else
-          echo "send-file-contents is false — SAST will be skipped by the platform."
+          echo "send-file-contents is false: only secrets will be scanned (code analysis and IaC checks need the files)."
         fi
 
         # ── Signed request ───────────────────────────────────────────────────
@@ -176,26 +177,36 @@ runs:
         # base64 via file, not --arg: one argv string is capped at 128 KB on Linux (E2BIG).
         base64 -w0 < "$DIFF" > "$DIFF.b64" 2>/dev/null || base64 < "$DIFF" | tr -d '\n' > "$DIFF.b64"
 
+        # The run's id (it only grows with each new run; a re-run keeps its old one) and, without it, the commit's
+        # time order two scans of one branch that finish out of order; the default branch decides a finding found on
+        # several branches.
+        COMMITTED_AT=$(git log -1 --format=%cI HEAD 2>/dev/null || true)
         jq -n \
           --arg repo "$GITHUB_REPOSITORY" \
           --arg branch "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" \
           --arg commitSha "$GITHUB_SHA" \
+          --arg sequence "${GITHUB_RUN_ID:-}" \
+          --arg committedAt "$COMMITTED_AT" \
+          --arg defaultBranch "${DEFAULT_BRANCH:-}" \
           --rawfile diff "$DIFF.b64" \
           --arg githubToken "$GH_TOKEN_INPUT" \
           --argjson prNumber "${PR_NUMBER:-null}" \
           --slurpfile files "$FILES_JSON" \
           '{repo: $repo, branch: $branch, commitSha: $commitSha, diff: $diff, files: $files[0]}
+           + (if $sequence == "" then {} else {sequence: ($sequence | tonumber)} end)
+           + (if $committedAt == "" then {} else {committedAt: $committedAt} end)
+           + (if $defaultBranch == "" then {} else {defaultBranch: $defaultBranch} end)
            + (if $prNumber == null then {} else {prNumber: $prNumber} end)
            + (if $githubToken == "" then {} else {githubToken: $githubToken} end)' \
           > "$PAYLOAD"
 
         BYTES=$(wc -c < "$PAYLOAD" | tr -d ' ')
         if [ "$BYTES" -gt $((2 * 1024 * 1024)) ]; then
-          echo "::warning::Payload is ${BYTES} bytes (over the 2 MB cap); retrying without file contents."
+          echo "::warning::Payload is ${BYTES} bytes (over the 2 MB cap); sending without file contents, so only secrets will be scanned."
           jq 'del(.files)' "$PAYLOAD" > "$PAYLOAD.tmp" && mv "$PAYLOAD.tmp" "$PAYLOAD"
         fi
 
-        # Stamped HMAC-SHA256 (ADR-0155): the digest covers "<unix seconds>.<body>",
+        # Stamped HMAC-SHA256: the digest covers "<unix seconds>.<body>",
         # over the exact bytes curl sends (--data-binary is verbatim). The platform
         # accepts a stamp within five minutes and once, so every attempt signs
         # afresh: a resent signature is refused as already used. The pause between
@@ -225,6 +236,29 @@ runs:
           exit 0
         fi
 
+        # ── A scan the platform could not complete ─────────────────────────
+        # A scanner fault after the request was accepted still answers 200, with
+        # `error` in the body ({ passed: true, error: "scan_error" }): nothing was
+        # checked. fail-on-error fails on that too; left false (the default), the
+        # job passes with a warning that says nothing was checked. An answer that
+        # is not a JSON object (a proxy's page, an empty body) is the same case:
+        # read below, it would fail the job under `set -e` whatever fail-on-error says.
+        SCAN_ERROR="unreadable answer"
+        jq -e 'type == "object"' "$RESPONSE" >/dev/null 2>&1 && SCAN_ERROR=$(jq -r '.error // ""' "$RESPONSE")
+        if [ -n "$SCAN_ERROR" ]; then
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+          echo "findings=0"  >> "$GITHUB_OUTPUT"
+          echo "scan-id=$(jq -r '.scanId // ""' "$RESPONSE" 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+          echo "### Valystrum Security Scan" >> "$GITHUB_STEP_SUMMARY"
+          echo "The scan could not be completed (\`$SCAN_ERROR\`): nothing was checked." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$FAIL_ON_ERROR" = "true" ]; then
+            echo "::error::Valystrum could not complete the scan ($SCAN_ERROR); fail-on-error is true, so the job fails."
+            exit 1
+          fi
+          echo "::warning::Valystrum could not complete the scan ($SCAN_ERROR): nothing was checked. The job passes because fail-on-error is false."
+          exit 0
+        fi
+
         # NOT `.passed // true`: jq's `//` treats `false` as absent, so a failed
         # scan would read as a pass and the gate would never block anything.
         PASSED=$(jq -r 'if .passed == null then true else .passed end' "$RESPONSE")
@@ -237,14 +271,37 @@ runs:
         echo "findings=$COUNT"   >> "$GITHUB_OUTPUT"
         echo "scan-id=$SCAN_ID"  >> "$GITHUB_OUTPUT"
 
+        # ── A code and IaC scanner that did not finish the files sent ────────
+        # The files went, but the platform's scanner timed out, failed or is not
+        # configured, so code analysis, the IaC checks or both did not run;
+        # `scanned.checks` names what did, and what did still gates the merge.
+        # fail-on-error treats this as a scan the platform could not complete and
+        # fails the job once the summary and the findings are written; left false
+        # (the default), the job goes on with a warning that names what ran.
+        SENT=$(jq -r '(.files // []) | length' "$PAYLOAD")
+        CHECKS=$(jq -r '(.scanned.checks // ["secrets"]) | join(", ")' "$RESPONSE")
+        INCOMPLETE=""
+        case "$SAST_STATUS" in
+          timeout|error|not_configured) if [ "$SENT" -gt 0 ]; then INCOMPLETE="$SAST_STATUS"; fi ;;
+        esac
+        if [ -n "$INCOMPLETE" ]; then
+          if [ "$FAIL_ON_ERROR" = "true" ]; then
+            echo "::error::Valystrum's code and IaC scanner did not finish the files sent ($INCOMPLETE); only these checks ran: $CHECKS. fail-on-error is true, so the job fails."
+          else
+            echo "::warning::Valystrum's code and IaC scanner did not finish the files sent ($INCOMPLETE); only these checks ran: $CHECKS. The job goes on because fail-on-error is false."
+          fi
+        fi
+
         # ── Job summary ──────────────────────────────────────────────────────
         {
           echo "### Valystrum Security Scan"
           echo ""
           if [ "$SAST_STATUS" = "ok" ]; then
-            echo "Analysed **$SAST_FILES** file(s) — SAST + secrets + IaC."
+            echo "Analysed **$SAST_FILES** file(s): SAST, secrets and IaC."
+          elif [ -n "$INCOMPLETE" ]; then
+            echo "The code and IaC scanner did not finish the files sent (\`$INCOMPLETE\`). Checks that ran: $CHECKS."
           else
-            echo "Scanned the diff for secrets and IaC. Code analysis: \`$SAST_STATUS\`."
+            echo "Scanned the diff for secrets only. Code analysis and IaC checks: \`$SAST_STATUS\` (they need the changed files)."
           fi
           echo ""
           if [ "$COUNT" = "0" ]; then
@@ -267,6 +324,11 @@ runs:
         if [ "$PASSED" != "true" ]; then
           echo "::error::Valystrum: $COUNT finding(s), including critical/high. See the job summary."
           [ "$FAIL_ON_FINDINGS" = "true" ] && exit 1
+        fi
+
+        # The scanner that did not finish the files sent (above), once the summary and the findings are out.
+        if [ -n "$INCOMPLETE" ] && [ "$FAIL_ON_ERROR" = "true" ]; then
+          exit 1
         fi
 
         echo "Scan complete: $COUNT finding(s), passed=$PASSED."
